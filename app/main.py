@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import uuid
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -25,7 +26,45 @@ SOURCE_NAMES = ["东方财富", "新浪财经", "证券时报"]
 SOURCE_TIMEOUT_SECONDS = 45
 PAGE_LOAD_TIMEOUT_SECONDS = 25
 ANALYSIS_TIMEOUT_SECONDS = 240
+NEWS_LOOKBACK_DAYS = 1
 API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+
+# 搜索词不是单向“缩短”。用户输入任意一个词，都要扩展到同一组相关词。
+# 这样输入“茅台”能搜到“贵州茅台”，输入“贵州茅台”也能搜到“茅台”。
+STOCK_KEYWORD_GROUPS = [
+    {"贵州茅台", "茅台", "600519", "贵州茅台酒", "茅台集团"},
+    {"五粮液", "000858", "五粮液集团"},
+    {"宁德时代", "300750"},
+    {"三六零", "360", "601360"},
+    {"比亚迪", "002594"},
+    {"药明康德", "603259"},
+    {"中信证券", "600030"},
+    {"紫金矿业", "601899"},
+]
+
+
+def expand_stock_keywords(stock: str) -> list[str]:
+    """返回原始输入 + 命中的相关关键词，保持双向扩展。"""
+    query = str(stock or "").strip()
+    if not query:
+        return []
+    keywords = [query]
+    for group in STOCK_KEYWORD_GROUPS:
+        if any(term == query or term in query or query in term for term in group):
+            keywords.extend(sorted(group, key=lambda item: (-len(item), item)))
+    result = []
+    seen = set()
+    for keyword in keywords:
+        normalized = keyword.casefold()
+        if normalized not in seen:
+            result.append(keyword)
+            seen.add(normalized)
+    return result
+
+
+def title_matches_keywords(title: str, keywords: list[str]) -> bool:
+    text = str(title or "").casefold()
+    return any(keyword.casefold() in text for keyword in keywords if keyword)
 
 app = FastAPI(title="InvestorShield AI API", version="1.1.0")
 app.add_middleware(
@@ -132,58 +171,63 @@ def fetch_eastmoney(driver, stock: str, deadline):
     source = "东方财富"
     start = time.monotonic()
     result, seen = [], set()
-    log(f"{source} SOURCE_START stock={stock}")
+    keywords = expand_stock_keywords(stock)
+    log(f"{source} SOURCE_START stock={stock} keywords={keywords}")
     try:
-        safe_get(driver, f"https://so.eastmoney.com/news/s?keyword={stock}", source)
-        time.sleep(2)
-        try:
-            WebDriverWait(driver, 4).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), '默认排序')]"))
-            ).click()
-            time.sleep(0.5)
-            driver.find_element(By.XPATH, "//li[contains(text(), '按时间排序')]").click()
-            time.sleep(1)
-        except Exception:
-            log(f"{source} SORT_SKIP")
-        no_new_rounds = 0
-        for page in range(1, 13):
+        for keyword in keywords:
             if not within_budget(start, source):
                 break
-            items = driver.find_elements(By.CSS_SELECTOR, ".news-item, .news_item")
-            added = 0
-            for item in items:
+            url_keyword = urllib.parse.quote(keyword)
+            safe_get(driver, f"https://so.eastmoney.com/news/s?keyword={url_keyword}", source)
+            time.sleep(2)
+            try:
+                WebDriverWait(driver, 4).until(
+                    EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), '默认排序')]"))
+                ).click()
+                time.sleep(0.5)
+                driver.find_element(By.XPATH, "//li[contains(text(), '按时间排序')]").click()
+                time.sleep(1)
+            except Exception:
+                log(f"{source} SORT_SKIP keyword={keyword}")
+            no_new_rounds = 0
+            for page in range(1, 13):
                 if not within_budget(start, source):
                     break
-                try:
-                    date = universal_date_parse(item.text)
-                    links = item.find_elements(By.TAG_NAME, "a")
-                    if date and date < deadline:
-                        no_new_rounds = 2
+                items = driver.find_elements(By.CSS_SELECTOR, ".news-item, .news_item")
+                added = 0
+                for item in items:
+                    if not within_budget(start, source):
                         break
-                    if date and date >= deadline and links:
-                        link = links[0]
-                        url, title = link.get_attribute("href"), link.text.strip()
-                        if url and title and url not in seen and stock.lower() in title.lower():
-                            result.append({"日期": date, "标题": title, "链接": url, "来源": source})
-                            seen.add(url)
-                            added += 1
+                    try:
+                        date = universal_date_parse(item.text)
+                        links = item.find_elements(By.TAG_NAME, "a")
+                        if date and date < deadline:
+                            no_new_rounds = 2
+                            break
+                        if date and date >= deadline and links:
+                            link = links[0]
+                            url, title = link.get_attribute("href"), link.text.strip()
+                            if url and title and url not in seen and title_matches_keywords(title, keywords):
+                                result.append({"日期": date, "标题": title, "链接": url, "来源": source})
+                                seen.add(url)
+                                added += 1
+                    except Exception:
+                        continue
+                log(f"{source} KEYWORD={keyword} PAGE={page} ADDED={added} TOTAL={len(result)}")
+                no_new_rounds = no_new_rounds + 1 if added == 0 else 0
+                if no_new_rounds >= 2:
+                    break
+                try:
+                    next_button = driver.find_element(
+                        By.XPATH, "//a[text()='>'] | //a[contains(text(), '下一页')]"
+                    )
+                    driver.execute_script("arguments[0].click();", next_button)
+                    time.sleep(1.5)
                 except Exception:
-                    continue
-            log(f"{source} PAGE={page} ADDED={added} TOTAL={len(result)}")
-            no_new_rounds = no_new_rounds + 1 if added == 0 else 0
-            if no_new_rounds >= 2:
-                break
-            try:
-                next_button = driver.find_element(
-                    By.XPATH, "//a[text()='>'] | //a[contains(text(), '下一页')]"
-                )
-                driver.execute_script("arguments[0].click();", next_button)
-                time.sleep(1.5)
-            except Exception:
-                break
+                    break
     except Exception as exc:
         log(f"{source} SOURCE_ERROR type={exc.__class__.__name__}: {exc}")
-    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s")
+    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s keywords={keywords}")
     return result
 
 
@@ -191,48 +235,54 @@ def fetch_sina(driver, stock: str, deadline):
     source = "新浪财经"
     start = time.monotonic()
     result, seen = [], set()
-    log(f"{source} SOURCE_START stock={stock}")
+    keywords = expand_stock_keywords(stock)
+    log(f"{source} SOURCE_START stock={stock} keywords={keywords}")
     try:
-        safe_get(driver, f"https://search.sina.com.cn/?q={stock}&c=news", source)
-        time.sleep(2)
-        no_new_rounds = 0
-        for page in range(1, 13):
+        for keyword in keywords:
             if not within_budget(start, source):
                 break
-            items = driver.find_elements(By.CSS_SELECTOR, ".box-result, .result, article")
-            added = 0
-            for item in items:
+            url_keyword = urllib.parse.quote(keyword)
+            safe_get(driver, f"https://search.sina.com.cn/?q={url_keyword}&c=news", source)
+            time.sleep(2)
+            no_new_rounds = 0
+            for page in range(1, 13):
                 if not within_budget(start, source):
                     break
-                try:
-                    text = item.text.strip()
-                    date = universal_date_parse(text)
-                    links = item.find_elements(By.TAG_NAME, "a")
-                    if date and date < deadline:
-                        no_new_rounds = 2
+                items = driver.find_elements(By.CSS_SELECTOR, ".box-result, .result, article")
+                added = 0
+                for item in items:
+                    if not within_budget(start, source):
                         break
-                    if date and date >= deadline and links:
-                        link = links[0]
-                        url, title = link.get_attribute("href"), link.text.strip()
-                        if url and title and url not in seen and stock.lower() in title.lower():
-                            result.append({"日期": date, "标题": title, "链接": url, "来源": source})
-                            seen.add(url)
-                            added += 1
+                    try:
+                        text = item.text.strip()
+                        date_nodes = item.find_elements(By.CLASS_NAME, "fgray_time")
+                        date = universal_date_parse(date_nodes[0].text if date_nodes else text)
+                        title_nodes = item.find_elements(By.CSS_SELECTOR, "h2 a, h3 a, .c-title a")
+                        link = title_nodes[0] if title_nodes else (item.find_elements(By.TAG_NAME, "a") or [None])[0]
+                        if date and date < deadline:
+                            no_new_rounds = 2
+                            break
+                        if date and date >= deadline and link is not None:
+                            url, title = link.get_attribute("href"), link.text.strip()
+                            if url and title and url not in seen and title_matches_keywords(title, keywords):
+                                result.append({"日期": date, "标题": title, "链接": url, "来源": source})
+                                seen.add(url)
+                                added += 1
+                    except Exception:
+                        continue
+                log(f"{source} KEYWORD={keyword} PAGE={page} ADDED={added} TOTAL={len(result)}")
+                no_new_rounds = no_new_rounds + 1 if added == 0 else 0
+                if no_new_rounds >= 2:
+                    break
+                try:
+                    next_button = driver.find_element(By.XPATH, "//a[contains(text(), '下一页')]")
+                    driver.execute_script("arguments[0].click();", next_button)
+                    time.sleep(1.5)
                 except Exception:
-                    continue
-            log(f"{source} PAGE={page} ADDED={added} TOTAL={len(result)}")
-            no_new_rounds = no_new_rounds + 1 if added == 0 else 0
-            if no_new_rounds >= 2:
-                break
-            try:
-                next_button = driver.find_element(By.XPATH, "//a[contains(text(), '下一页')]")
-                driver.execute_script("arguments[0].click();", next_button)
-                time.sleep(1.5)
-            except Exception:
-                break
+                    break
     except Exception as exc:
         log(f"{source} SOURCE_ERROR type={exc.__class__.__name__}: {exc}")
-    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s")
+    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s keywords={keywords}")
     return result
 
 
@@ -240,59 +290,64 @@ def fetch_stcn(driver, stock: str, deadline):
     source = "证券时报"
     start = time.monotonic()
     result, seen = [], set()
-    log(f"{source} SOURCE_START stock={stock}")
+    keywords = expand_stock_keywords(stock)
+    log(f"{source} SOURCE_START stock={stock} keywords={keywords}")
     try:
-        safe_get(driver, f"https://www.stcn.com/article/search.html?keyword={stock}", source)
-        time.sleep(3)
-        no_new_rounds = 0
-        last_height = 0
-        for scroll in range(1, 16):
+        for keyword in keywords:
             if not within_budget(start, source):
                 break
-            items = driver.find_elements(
-                By.CSS_SELECTOR,
-                "li[class*='item'], li[class*='news'], div.item, div[class*='item'], div[class*='news'], article",
-            )
-            added = 0
-            found_old = False
-            for item in items:
+            url_keyword = urllib.parse.quote(keyword)
+            safe_get(driver, f"https://www.stcn.com/article/search.html?keyword={url_keyword}", source)
+            time.sleep(3)
+            no_new_rounds = 0
+            last_height = 0
+            for scroll in range(1, 16):
                 if not within_budget(start, source):
                     break
-                try:
-                    text = item.text.strip()
-                    if len(text) < 8:
+                items = driver.find_elements(
+                    By.XPATH,
+                    "//li[.//a] | //div[contains(@class,'item')] | //div[contains(@class,'news')] | //article",
+                )
+                added = 0
+                found_old = False
+                for item in items:
+                    if not within_budget(start, source):
+                        break
+                    try:
+                        text = item.text.strip()
+                        if len(text) < 8:
+                            continue
+                        date = universal_date_parse(text)
+                        links = item.find_elements(By.TAG_NAME, "a")
+                        if not links:
+                            continue
+                        link = links[0]
+                        url, title = link.get_attribute("href"), link.text.strip()
+                        if not url or not title or url in seen:
+                            continue
+                        if date and date < deadline:
+                            found_old = True
+                        elif date and date >= deadline and title_matches_keywords(title, keywords):
+                            result.append({"日期": date, "标题": title, "链接": url, "来源": source})
+                            seen.add(url)
+                            added += 1
+                    except Exception:
                         continue
-                    date = universal_date_parse(text)
-                    links = item.find_elements(By.TAG_NAME, "a")
-                    if not links:
-                        continue
-                    link = links[0]
-                    url, title = link.get_attribute("href"), link.text.strip()
-                    if not url or not title or url in seen:
-                        continue
-                    if date and date < deadline:
-                        found_old = True
-                    elif date and date >= deadline and stock.lower() in title.lower():
-                        result.append({"日期": date, "标题": title, "链接": url, "来源": source})
-                        seen.add(url)
-                        added += 1
-                except Exception:
-                    continue
-            log(f"{source} SCROLL={scroll} ADDED={added} TOTAL={len(result)}")
-            if found_old:
-                break
-            no_new_rounds = no_new_rounds + 1 if added == 0 else 0
-            if no_new_rounds >= 3:
-                break
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height and added == 0:
-                break
-            last_height = new_height
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)
+                log(f"{source} KEYWORD={keyword} SCROLL={scroll} ADDED={added} TOTAL={len(result)}")
+                if found_old:
+                    break
+                no_new_rounds = no_new_rounds + 1 if added == 0 else 0
+                if no_new_rounds >= 3:
+                    break
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height and added == 0:
+                    break
+                last_height = new_height
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1.5)
     except Exception as exc:
         log(f"{source} SOURCE_ERROR type={exc.__class__.__name__}: {exc}")
-    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s")
+    log(f"{source} SOURCE_END count={len(result)} elapsed={time.monotonic() - start:.1f}s keywords={keywords}")
     return result
 
 
@@ -380,8 +435,9 @@ def run_analysis(job_id: str, stock: str):
     warnings: list[str] = []
     started = time.monotonic()
     try:
-        deadline = datetime.now().date() - timedelta(days=1)
-        log(f"JOB_START id={job_id} stock={stock}")
+        deadline = datetime.now().date() - timedelta(days=NEWS_LOOKBACK_DAYS)
+        keywords = expand_stock_keywords(stock)
+        log(f"JOB_START id={job_id} stock={stock} keywords={keywords} lookback_days={NEWS_LOOKBACK_DAYS}")
         set_job(job_id, progress=8, message="正在启动新闻采集", source_status={name: {"status": "waiting", "message": "等待中"} for name in SOURCE_NAMES})
         driver = get_stealth_driver()
         raw_data = []
@@ -404,9 +460,9 @@ def run_analysis(job_id: str, stock: str):
         if not raw_data:
             raise RuntimeError("未抓取到有效新闻，可能是网站结构变化或浏览器环境不可用")
         df = pd.DataFrame(raw_data).drop_duplicates(subset=["链接"])
-        df = df[df["标题"].str.contains(stock, case=False, na=False)].copy()
+        df = df[df["标题"].apply(lambda title: title_matches_keywords(title, keywords))].copy()
         if df.empty:
-            raise RuntimeError("未筛选到与股票名称匹配的新闻")
+            raise RuntimeError(f"未筛选到与关键词匹配的新闻：{keywords}")
         set_job(job_id, progress=78, message=f"正在对 {len(df)} 条新闻进行 AI 分析", source_status={name: {"status": "completed", "message": "已完成"} for name in SOURCE_NAMES}, warnings=warnings)
         report, score, scores = score_and_report(df, stock)
         result = normalize_report(report, score, df, scores, warnings)
